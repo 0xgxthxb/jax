@@ -15,7 +15,7 @@
 from enum import IntEnum
 import numpy as np
 from collections import OrderedDict, Counter
-from typing import Callable, Sequence, Tuple, Union, Optional
+from typing import Callable, Sequence, Tuple, Union, Optional, List, cast
 import itertools as it
 from functools import partial
 
@@ -58,6 +58,10 @@ def _is_from_gda(x):
   # pickling in_axis_resources and sending to other processes). Make sure this
   # doesn't cause an error to avoid user confusion.
   return isinstance(x, type(FROM_GDA))
+
+_AUTOAxisResource = pxla._AUTOAxisResource
+AUTO = pxla.AUTO
+_is_auto = pxla._is_auto
 
 
 # TODO(yashkatariya): Add pjit microbenchmarks.
@@ -242,9 +246,11 @@ def pjit(fun: Callable,
     global_in_avals, canonicalized_in_axis_resources_flat = _process_in_axis_resources(
         mesh, local_in_avals, hashable_pytree(in_axis_resources), in_tree,
         in_positional_semantics, tuple(isinstance(a, GDA) for a in args_flat))
+
     jaxpr, canonicalized_out_axis_resources_flat = _pjit_jaxpr(
         flat_fun, mesh, global_in_avals, HashableFunction(out_tree, closure=()),
         hashable_pytree(out_axis_resources))
+
     canonicalized_in_axis_resources_flat = tree_map(
         _maybe_replace_from_gda_with_pspec,
         canonicalized_in_axis_resources_flat, tuple(args_flat))
@@ -376,7 +382,7 @@ def _process_in_axis_resources(mesh, local_in_avals, in_axis_resources_thunk,
   # Use canonicalized in_axis_resources here because we want to treat P(None)
   # and None (for example) as equivalent.
   if all(
-      (not _is_from_gda(p) and p.partitions == ()) or ips == maps._PositionalSemantics.GLOBAL
+      (not _is_from_gda(p) and not _is_auto(p) and p.partitions == ()) or ips == maps._PositionalSemantics.GLOBAL
       for p, ips in safe_zip(canonicalized_in_axis_resources_flat, in_positional_semantics)):
     # Shapes should be checked against non canonicalized in_axis_resources.
     # For example, partitions of () and ((),) are not equivalent, since the
@@ -536,13 +542,27 @@ def _prepare_axis_resources(axis_resources,
   # PyTrees don't treat None values as leaves, so we use an is_leaf function.
   entries, treedef = tree_flatten(axis_resources, is_leaf=lambda x: x is None)
   what = f"{arg_name} leaf specifications"
+  # TODO(yashkatariya): Allow AUTO and other specification together after
+  # auto sharding pass supports user specified annotations.
+  all_auto = _check_if_all_auto(entries, arg_name)
   entries = [
-      entry if _is_from_gda(entry) else ParsedPartitionSpec.from_user_input(
+      entry if _is_from_gda(entry) or _is_auto(entry) else
+      ParsedPartitionSpec.from_user_input(
           entry, what, allow_unconstrained_dims=allow_unconstrained_dims)
       for entry in entries
   ]
-  _check_unique_resources(entries, arg_name)
+  if not all_auto:
+    _check_unique_resources(entries, arg_name)
   return tree_unflatten(treedef, entries), entries, treedef
+
+
+def _check_if_all_auto(axis_resources, name):
+  should_auto = _is_auto(axis_resources[0])
+  for resource in axis_resources:
+    if _is_auto(resource) != should_auto:
+      raise ValueError(f'`pjit.AUTO` exists in {name}. '
+                       f'Make sure that every entry in {name} is `pjit.AUTO`.')
+  return should_auto
 
 def _check_resources_mismatch(in_axis_resources_flat, is_gda):
   if not is_gda and _is_from_gda(in_axis_resources_flat):
@@ -569,6 +589,8 @@ def _check_shapes_against_resources(what: str, is_global_shape: bool,
   global_str = " global" if is_global_shape else ""
   for aval, aval_axis_resources in zip(flat_avals, flat_axis_resources):
     if _is_from_gda(aval_axis_resources):
+      continue
+    if _is_auto(aval_axis_resources):
       continue
     shape = aval.shape
     if len(shape) < len(aval_axis_resources):
@@ -605,6 +627,11 @@ def _pjit_call_impl(*args, jaxpr,
   compiled = _pjit_lower(
       jaxpr, in_axis_resources, out_axis_resources,
       resource_env, donated_invars, name, in_is_global).compile()
+  # Check the GDA sharding and the sharding returned by the auto spmd partitoner
+  # only if auto_spmd_lowering is enabled.
+  if compiled._auto_spmd_lowering:
+    in_pspec, _ = _get_sharding_from_executable(compiled.xla_executable, resource_env.physical_mesh)
+    _check_gda_xla_sharding_match(args, in_pspec)
   distributed_debug_log(("Running pjit'd function", name),
                         ("mesh", resource_env.physical_mesh))
   return compiled.unsafe_call(*args)
@@ -788,16 +815,14 @@ def _pjit_partial_eval(trace, *in_tracers,
   if num_residuals:
     in_is_global = _calc_is_global_sequence(
         known_params['in_positional_semantics'], known_params['in_axis_resources'])
-    executable = _pjit_lower(
+    compiled = _pjit_lower(
         known_params["jaxpr"], known_params["in_axis_resources"],
         known_params["out_axis_resources"], known_params["resource_env"],
         known_params["donated_invars"], known_params["name"],
         in_is_global).compile(_allow_propagation_to_outputs=True,
                               _allow_compile_replicated=False)
-    output_op_sharding = \
-        executable.xla_executable.hlo_modules()[0].spmd_output_sharding
-    output_sharding_specs = parse_op_sharding(output_op_sharding, mesh)
-    residual_specs = tuple(output_sharding_specs[-num_residuals:])
+    _, output_ppspec = _get_ppspec_from_executable(compiled.xla_executable, mesh)
+    residual_specs = tuple(output_ppspec[-num_residuals:])
   else:
     residual_specs = ()
   known_params['out_axis_resources'] = (
@@ -1021,7 +1046,10 @@ pxla.custom_resource_typing_rules[sharding_constraint_p] = \
 
 # -------------------- helpers --------------------
 
-def get_array_mapping(axis_resources: ParsedPartitionSpec) -> pxla.ArrayMapping:
+def get_array_mapping(axis_resources: Union[ParsedPartitionSpec, _AUTOAxisResource]) -> pxla.AutoArrayMapping:
+  # Don't use `_is_auto` here to satisfy pytype and mypy.
+  if isinstance(axis_resources, _AUTOAxisResource):
+    return axis_resources
   return OrderedDict((axis, i)
                      for i, axes in enumerate(axis_resources)
                      if axes is not None for axis in axes)
@@ -1069,6 +1097,23 @@ def _calc_is_global_sequence(in_positional_semantics, in_axis_resources):
       ips == maps._PositionalSemantics.GLOBAL or p.partitions == ()
       for ips, p in safe_zip(in_positional_semantics, in_axis_resources))
 
+def _check_gda_xla_sharding_match(args, in_pspec):
+  for arg, ip in safe_zip(args, in_pspec):
+    if isinstance(arg, GDA):
+      gda_cpspec = CanonicalizedParsedPartitionSpec(
+        ParsedPartitionSpec.from_user_input(
+            arg.mesh_axes, arg_name="GDA mesh_axes"))
+      in_cpspec = CanonicalizedParsedPartitionSpec(
+          ParsedPartitionSpec.from_user_input(ip, arg_name="auto sharding pspec"))
+      if in_cpspec != gda_cpspec:
+        raise ValueError(
+            "GDA sharding does not match the sharding returned by auto spmd "
+            "partitioner. Did you create the GDA with the input sharding "
+            "returned by `pjit.get_sharding_from_xla`? "
+            "If yes, please file a bug. "
+            f"Got GDA spec: {gda_cpspec.user_spec} and "
+            f"auto sharding spec: {in_cpspec.user_spec} for GDA: {arg}")
+
 def _get_in_positional_semantics(global_avals: bool, arg) -> maps._PositionalSemantics:
   if isinstance(arg, GDA):
     return maps._PositionalSemantics.GLOBAL
@@ -1077,11 +1122,15 @@ def _get_in_positional_semantics(global_avals: bool, arg) -> maps._PositionalSem
   return maps._positional_semantics.val
 
 def _create_cpspec(x):
-  return x if _is_from_gda(x) else CanonicalizedParsedPartitionSpec(x)
+  return x if _is_from_gda(x) or _is_auto(x) else CanonicalizedParsedPartitionSpec(x)
 
 def _maybe_replace_from_gda_with_pspec(
-    in_axis_resources_flat: CanonicalizedParsedPartitionSpec, arg) -> CanonicalizedParsedPartitionSpec:
+    in_axis_resources_flat: Union[CanonicalizedParsedPartitionSpec, _AUTOAxisResource],
+    arg) -> Union[CanonicalizedParsedPartitionSpec, _AUTOAxisResource]:
   if isinstance(arg, GDA):
+    # Don't use `_is_auto` here to satisfy pytype and mypy.
+    if isinstance(in_axis_resources_flat, _AUTOAxisResource):
+      return in_axis_resources_flat
     gda_cpspec = CanonicalizedParsedPartitionSpec(
         ParsedPartitionSpec.from_user_input(
             arg.mesh_axes, arg_name="GDA mesh_axes"))
@@ -1233,3 +1282,41 @@ def parse_op_sharding(op_sharding, mesh):
     return ParsedPartitionSpec('<internally generated spec>', partitions)
   else:
     raise AssertionError("Unhandled OpSharding type. Please open a bug report!")
+
+
+def _get_partition_spec(ppspec: Union[List[ParsedPartitionSpec], ParsedPartitionSpec]) -> Sequence[PartitionSpec]:
+  if isinstance(ppspec, list):
+    return [pxla.array_mapping_to_axis_resources(cast(pxla.ArrayMapping, get_array_mapping(p)))
+            for p in ppspec]
+  else:
+    return [pxla.array_mapping_to_axis_resources(cast(pxla.ArrayMapping, get_array_mapping(ppspec)))]
+
+
+def _get_ppspec_from_executable(executable, mesh):
+  input_op_shardings = executable.hlo_modules()[0].spmd_parameters_shardings
+  output_op_sharding = executable.hlo_modules()[0].spmd_output_sharding
+  in_ppspec = [parse_op_sharding(sharding, mesh) for sharding in input_op_shardings]
+  out_ppspec = parse_op_sharding(output_op_sharding, mesh)
+  return in_ppspec, out_ppspec
+
+
+def _get_sharding_from_executable(
+    executable, mesh: pxla.Mesh
+) -> Tuple[Tuple[PartitionSpec, ...], Tuple[PartitionSpec, ...]]:
+  in_ppspec, out_ppspec = _get_ppspec_from_executable(executable, mesh)
+  out_partition_spec = _get_partition_spec(out_ppspec)
+
+  in_partition_spec: List[PartitionSpec] = []
+  for spec in in_ppspec:
+    in_partition_spec.extend(_get_partition_spec(spec))
+
+  return tuple(in_partition_spec), tuple(out_partition_spec)
+
+
+def get_sharding_from_xla(pjitted_fn, mesh, global_shapes, dtypes):
+  # TODO(yashkatariya): Check if the pjitted_fn comes from pjit.
+  inputs = [core.ShapedArray(s, d) for s, d in safe_zip(global_shapes, dtypes)]
+  compiled = pjitted_fn.lower(*inputs, _global_avals=True).compile()
+  in_sharding, out_sharding = _get_sharding_from_executable(
+      compiled.runtime_executable(), mesh)
+  return in_sharding, out_sharding
